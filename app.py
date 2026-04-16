@@ -1,18 +1,48 @@
 """
 Kronos Prediction Web App
 INPUT: Ticker symbols via Streamlit UI -> yfinance fetches OHLCVA data
-OUTPUT: Plotly charts (1-year % return vs ACWI, candlestick + volume), statistical metrics grid
+OUTPUT: Plotly charts (1-year % return vs benchmark ETF, candlestick OHLC), statistical metrics grid
 Last updated: 2026-04-15
 """
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 import streamlit as st
 import time
 import ta
 from datetime import datetime, timedelta
+import torch
 import yfinance as yf
+
+# Benchmark ETFs for return comparison (yfinance symbols)
+BENCHMARK_CHOICES = ("ACWI", "SPY", "CQQQ")
+BENCHMARK_LABELS = {
+    "ACWI": "ACWI (MSCI ACWI)",
+    "SPY": "SPY (S&P 500)",
+    "CQQQ": "CQQQ (China tech)",
+}
+
+# Kronos sampling — temperature and fixed RNG for reproducible forecasts
+KRONOS_TEMPERATURE = 0.6
+KRONOS_TOP_P = 0.9
+KRONOS_SAMPLE_COUNT = 10
+KRONOS_RANDOM_SEED = 42
+
+
+def set_inference_seed(seed: int = KRONOS_RANDOM_SEED) -> None:
+    """Reset RNGs before predict so torch.multinomial sampling is reproducible."""
+    import random
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        try:
+            torch.mps.manual_seed(seed)
+        except (AttributeError, RuntimeError):
+            pass
 
 
 # ============================================================
@@ -77,18 +107,22 @@ def get_business_dates(start_date, n_days):
 # ============================================================
 # PREDICTION ENGINE
 # ============================================================
-@st.cache_resource(show_spinner="Running ACWI benchmark prediction (~30s, cached globally)...")
-def predict_acwi():
-    """Run Kronos prediction on ACWI once, cache globally."""
+@st.cache_resource(show_spinner="Running benchmark prediction (~30s, cached per benchmark)...")
+def predict_benchmark(benchmark_ticker: str, lookback_days: int, pred_len: int):
+    """Run Kronos on the chosen benchmark; cache key includes ticker and horizons."""
     predictor = load_model()
-    df = fetch_yfinance_data("ACWI", "2y").tail(40)
-    if len(df) < 40:
+    df = fetch_yfinance_data(benchmark_ticker, "2y")
+    if df is None or len(df) < lookback_days:
         return None
-    lookback = df.tail(40)
-    y_timestamp = get_business_dates(lookback.index[-1] + pd.Timedelta(days=1), 20)
+    lookback = df.tail(lookback_days)
+    y_timestamp = get_business_dates(
+        lookback.index[-1] + pd.Timedelta(days=1), pred_len
+    )
+    set_inference_seed(KRONOS_RANDOM_SEED)
     pred_df = predictor.predict(
         df=lookback, x_timestamp=lookback.index, y_timestamp=y_timestamp,
-        pred_len=20, T=0.8, top_p=0.9, sample_count=10
+        pred_len=pred_len, T=KRONOS_TEMPERATURE, top_p=KRONOS_TOP_P,
+        sample_count=KRONOS_SAMPLE_COUNT,
     )
     return pred_df
 
@@ -102,9 +136,11 @@ def predict_ticker(predictor, ticker, lookback_days=40, pred_len=20):
         raise ValueError(f"{ticker}: only {len(df)} days available, need {lookback_days}+")
     hist_df = df.tail(lookback_days)
     y_timestamp = get_business_dates(hist_df.index[-1] + pd.Timedelta(days=1), pred_len)
+    set_inference_seed(KRONOS_RANDOM_SEED)
     pred_df = predictor.predict(
         df=hist_df, x_timestamp=hist_df.index, y_timestamp=y_timestamp,
-        pred_len=pred_len, T=0.8, top_p=0.9, sample_count=10
+        pred_len=pred_len, T=KRONOS_TEMPERATURE, top_p=KRONOS_TOP_P,
+        sample_count=KRONOS_SAMPLE_COUNT,
     )
     return pred_df, hist_df
 
@@ -191,28 +227,30 @@ def compute_stats(df_hist: pd.DataFrame, pred_df: pd.DataFrame, df_full_year: pd
 # ============================================================
 # PLOTLY CHARTS
 # ============================================================
-def build_return_chart(df_hist_full, pred_df, acwi_hist, acwi_pred, ticker_name):
+def build_return_chart(
+    df_hist_full, pred_df, bench_hist, bench_pred, ticker_name, benchmark_label: str
+):
     """1-Year % Return chart — clean TradingView style.
     Single continuous line with predicted continuation. Minimal axes."""
 
     # Historical returns normalized to 0% at start
     asset_ret = df_hist_full['close'] / df_hist_full['close'].iloc[0] - 1
-    acwi_ret = acwi_hist['close'] / acwi_hist['close'].iloc[0] - 1
+    bench_ret = bench_hist['close'] / bench_hist['close'].iloc[0] - 1
 
     # Predicted returns on same 1Y scale: (pred_close / year_start) - 1
     base_asset = df_hist_full['close'].iloc[0]
-    base_acwi = acwi_hist['close'].iloc[0]
+    base_bench = bench_hist['close'].iloc[0]
     pred_ret = pred_df['close'] / base_asset - 1
-    acwi_pred_ret = acwi_pred['close'] / base_acwi - 1
+    bench_pred_ret = bench_pred['close'] / base_bench - 1
 
     # Build continuous data: append prediction to last historical point
     today = asset_ret.index[-1]
-    acwi_today = acwi_ret.iloc[-1]
+    bench_today = bench_ret.iloc[-1]
 
     asset_y = np.concatenate([[asset_ret.values[-1]], pred_ret.values]) * 100
     asset_x = pd.DatetimeIndex([today]).append(pred_ret.index)
-    acwi_y = np.concatenate([[acwi_today], acwi_pred_ret.values]) * 100
-    acwi_x = pd.DatetimeIndex([today]).append(acwi_pred_ret.index)
+    bench_y = np.concatenate([[bench_today], bench_pred_ret.values]) * 100
+    bench_x = pd.DatetimeIndex([today]).append(bench_pred_ret.index)
 
     fig = go.Figure()
 
@@ -223,7 +261,7 @@ def build_return_chart(df_hist_full, pred_df, acwi_hist, acwi_pred, ticker_name)
         showlegend=False
     ))
     fig.add_trace(go.Scatter(
-        x=acwi_ret.index, y=acwi_ret.values * 100, name='ACWI',
+        x=bench_ret.index, y=bench_ret.values * 100, name=benchmark_label,
         mode='lines', line=dict(color='rgba(128,128,128,0.6)', width=1.5),
         showlegend=False
     ))
@@ -235,16 +273,16 @@ def build_return_chart(df_hist_full, pred_df, acwi_hist, acwi_pred, ticker_name)
         showlegend=False
     ))
     fig.add_trace(go.Scatter(
-        x=acwi_x, y=acwi_y, name='ACWI Predicted',
+        x=bench_x, y=bench_y, name=f'{benchmark_label} Predicted',
         mode='lines', line=dict(color='rgba(128,128,128,0.4)', width=1.5, dash='dot'),
         showlegend=False
     ))
 
     # 0% reference line
-    y_min = min(asset_ret.min(), acwi_ret.min()) * 100
+    y_min = min(asset_ret.min(), bench_ret.min()) * 100
     y_max = max(
-        max(asset_ret.max(), acwi_ret.max()) * 100,
-        max(asset_y.max(), acwi_y.max())
+        max(asset_ret.max(), bench_ret.max()) * 100,
+        max(asset_y.max(), bench_y.max())
     )
     fig.add_shape(type='line', x0=asset_ret.index[0], y0=0,
                   x1=asset_x[-1], y1=0,
@@ -260,7 +298,7 @@ def build_return_chart(df_hist_full, pred_df, acwi_hist, acwi_pred, ticker_name)
 
     # Clean layout
     fig.update_layout(
-        title=dict(text=f"{ticker_name} vs ACWI", font=dict(size=16)),
+        title=dict(text=f"{ticker_name} vs {benchmark_label}", font=dict(size=16)),
         plot_bgcolor='white', margin=dict(l=50, r=30, t=50, b=40),
         height=420,
         legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="right", x=1),
@@ -272,49 +310,51 @@ def build_return_chart(df_hist_full, pred_df, acwi_hist, acwi_pred, ticker_name)
 
 
 def build_candlestick_chart(df_hist, pred_df, ticker_name):
-    """Candlestick chart with volume subplot. Predicted candles at half opacity."""
-    fig = make_subplots(
-        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.02,
-        row_heights=[0.75, 0.25]
-    )
+    """Single-panel OHLC candlestick: historical + predicted (no volume)."""
+    fig = go.Figure()
 
-    # Historical candles
+    # Historical — solid green/red by direction (close vs open)
     fig.add_trace(go.Candlestick(
-        x=df_hist.index, open=df_hist['open'], high=df_hist['high'],
-        low=df_hist['low'], close=df_hist['close'],
-        name="Historical", increasing_line_color='green', decreasing_line_color='red'
-    ), row=1, col=1)
+        x=df_hist.index,
+        open=df_hist['open'],
+        high=df_hist['high'],
+        low=df_hist['low'],
+        close=df_hist['close'],
+        name="Historical",
+        increasing_line_color="#15803d",
+        decreasing_line_color="#b91c1c",
+        increasing_fillcolor="#22c55e",
+        decreasing_fillcolor="#ef4444",
+    ))
 
-    # Predicted candles (lighter)
+    # Predicted — same green/red logic, slightly softer fills so it reads as forecast
     fig.add_trace(go.Candlestick(
-        x=pred_df.index, open=pred_df['open'], high=pred_df['high'],
-        low=pred_df['low'], close=pred_df['close'],
-        name="Predicted", opacity=0.5,
-        increasing_line_color='#1f77b4', decreasing_line_color='#ff7f0e'
-    ), row=1, col=1)
+        x=pred_df.index,
+        open=pred_df['open'],
+        high=pred_df['high'],
+        low=pred_df['low'],
+        close=pred_df['close'],
+        name="Predicted",
+        increasing_line_color="#15803d",
+        decreasing_line_color="#b91c1c",
+        increasing_fillcolor="rgba(34, 197, 94, 0.55)",
+        decreasing_fillcolor="rgba(239, 68, 68, 0.55)",
+        line=dict(width=1),
+    ))
 
-    # Volume bars
-    fig.add_trace(go.Bar(
-        x=df_hist.index, y=df_hist['volume'], name='Volume',
-        marker_color='gray', opacity=0.4
-    ), row=2, col=1)
-    fig.add_trace(go.Bar(
-        x=pred_df.index, y=pred_df['volume'], name='Pred Volume',
-        marker_color='#1f77b4', opacity=0.3
-    ), row=2, col=1)
-
-    # Separator line
     today = df_hist.index[-1]
-    fig.add_vline(x=today, line_dash="dot", line_color="gray", opacity=0.4, row=1, col=1)
+    fig.add_vline(
+        x=today, line_dash="dot", line_color="gray", opacity=0.45,
+    )
 
     fig.update_layout(
-        title=f"{ticker_name} — Candlestick + Volume",
-        height=650,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        title=f"{ticker_name} — Candlestick (historical + predicted)",
+        height=520,
+        xaxis_rangeslider_visible=False,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
-    fig.update_yaxes(title_text="Price", row=1, col=1)
-    fig.update_yaxes(title_text="Volume", row=2, col=1)
-    fig.update_xaxes(title_text="Date", row=2, col=1)
+    fig.update_yaxes(title_text="Price")
+    fig.update_xaxes(title_text="Date")
 
     return fig
 
@@ -324,25 +364,46 @@ def build_candlestick_chart(df_hist, pred_df, ticker_name):
 # ============================================================
 def main():
     st.set_page_config(
-        page_title="Kronos Stock Predictor", page_icon="📈", layout="wide"
+        page_title="Kronos Stock Predictor",
+        page_icon="📈",
+        layout="wide",
+        initial_sidebar_state="collapsed",
     )
 
     st.title("Kronos Stock Prediction")
-    st.caption("AI-powered prediction with ACWI benchmark comparison")
+    st.caption("AI-powered prediction with selectable benchmark (ACWI, SPY, or CQQQ)")
 
     # Disclaimer
     st.info("⚠️ Predictions generated using a general time-series model. Not financial advice.")
 
-    # Sidebar
-    with st.sidebar:
-        st.header("Settings")
-        lookback = st.slider("Lookback Days", min_value=20, max_value=100, value=40, step=5)
-        pred_len = st.slider("Prediction Days", min_value=5, max_value=30, value=20, step=5)
-        st.divider()
-        if st.button("Clear ACWI Cache", help="Re-run ACWI prediction on next query"):
-            # Clear only the ACWI prediction cache, preserve the loaded model
-            st.cache_resource.clear()
-            st.success("Cache cleared. ACWI will be re-predicted next run.")
+    # Settings live in the main column so benchmark / horizons are always visible
+    # (Streamlit’s left sidebar is easy to miss when collapsed).
+    st.subheader("Settings")
+    col_b, col_l, col_p = st.columns([1.5, 1, 1])
+    with col_b:
+        benchmark = st.selectbox(
+            "Benchmark ETF",
+            options=list(BENCHMARK_CHOICES),
+            index=0,
+            format_func=lambda t: BENCHMARK_LABELS.get(t, t),
+            help="Compare 1-year return vs this ETF and use it for the benchmark forecast.",
+        )
+    with col_l:
+        lookback = st.slider(
+            "Lookback Days", min_value=20, max_value=100, value=40, step=5
+        )
+    with col_p:
+        pred_len = st.slider(
+            "Prediction Days", min_value=5, max_value=30, value=20, step=5
+        )
+    if st.button(
+        "Clear benchmark cache",
+        help="Clear cached benchmark predictions (model stays loaded)",
+    ):
+        st.cache_resource.clear()
+        st.success("Cache cleared. Benchmarks will be re-predicted on the next run.")
+
+    st.divider()
 
     # Input
     ticker = st.text_input("Enter Ticker Symbol", value="AAPL").strip().upper()
@@ -364,14 +425,15 @@ def main():
             with st.spinner("Loading Kronos model..."):
                 predictor = load_model()
 
-            # Fetch ACWI benchmark data (cached globally)
-            with st.spinner("Fetching ACWI benchmark..."):
+            # Benchmark history + Kronos forecast (cached per ticker / horizons)
+            bench_label = BENCHMARK_LABELS.get(benchmark, benchmark)
+            with st.spinner(f"Fetching & predicting {benchmark} benchmark..."):
                 try:
-                    acwi_pred = predict_acwi()
-                    acwi_hist_full = fetch_yfinance_data("ACWI", "1y")
+                    bench_pred = predict_benchmark(benchmark, lookback, pred_len)
+                    bench_hist_full = fetch_yfinance_data(benchmark, "1y")
                 except Exception:
-                    acwi_pred = None
-                    acwi_hist_full = None
+                    bench_pred = None
+                    bench_hist_full = None
 
             # Run prediction
             with st.spinner(f"Predicting {ticker} ({lookback}d lookback → {pred_len}d forecast)..."):
@@ -383,9 +445,11 @@ def main():
                 y_timestamp = get_business_dates(
                     hist_df.index[-1] + pd.Timedelta(days=1), pred_len
                 )
+                set_inference_seed(KRONOS_RANDOM_SEED)
                 pred_df = predictor.predict(
                     df=hist_df, x_timestamp=hist_df.index, y_timestamp=y_timestamp,
-                    pred_len=pred_len, T=0.8, top_p=0.9, sample_count=10
+                    pred_len=pred_len, T=KRONOS_TEMPERATURE, top_p=KRONOS_TOP_P,
+                    sample_count=KRONOS_SAMPLE_COUNT,
                 )
 
             # Compute stats
@@ -396,10 +460,23 @@ def main():
             st.subheader(f"Prediction for {ticker}")
 
             # Chart 1: 1-Year % Return
-            st.plotly_chart(
-                build_return_chart(df_full_year, pred_df, acwi_hist_full, acwi_pred, ticker),
-                use_container_width=True
-            )
+            if bench_hist_full is not None and bench_pred is not None and not bench_hist_full.empty:
+                st.plotly_chart(
+                    build_return_chart(
+                        df_full_year,
+                        pred_df,
+                        bench_hist_full,
+                        bench_pred,
+                        ticker,
+                        bench_label,
+                    ),
+                    use_container_width=True,
+                )
+            else:
+                st.warning(
+                    f"Could not load or predict benchmark {benchmark}. "
+                    "Check the symbol or try again."
+                )
 
             # Chart 2: Candlestick
             st.plotly_chart(

@@ -1,7 +1,7 @@
 ---
 
 name: Kronos Web App
-overview: Clone the GitHub repo into a clean self-contained project, remove unnecessary files, add the Kronos model and build a Streamlit web app for stock prediction with technical stats and ACWI benchmark comparison.
+overview: Clone the GitHub repo into a clean self-contained project, remove unnecessary files, add the Kronos model and build a Streamlit web app for stock prediction with technical stats and a selectable ETF benchmark (ACWI, SPY, or CQQQ).
 todos:
 
 - id: clone-repo
@@ -14,16 +14,16 @@ status: pending
 content: Create .streamlit/config.toml (light theme, server port 8501)
 status: pending
 - id: write-app-core
-content: "Write app.py: model loading (@st.cache_resource), data fetching with yfinance retry/fallback, prediction engine, global ACWI cache"
+content: "Write app.py: model loading (@st.cache_resource), data fetching with yfinance retry/fallback, prediction engine, cached benchmark predictions (ACWI / SPY / CQQQ)"
 status: pending
 - id: write-stats
 content: "Write app.py: compute_stats function with graceful fallbacks (SMA 200 N/A if < 200 days)"
 status: pending
 - id: write-charts
-content: "Write app.py: Plotly charts (1-year % return vs ACWI + predictions, candlestick + volume)"
+content: "Write app.py: Plotly charts (1-year % return vs selected benchmark + predictions, candlestick OHLC)"
 status: pending
 - id: write-ui
-content: "Write app.py: Streamlit UI layout with sidebar settings, error handling, metrics grid"
+content: "Write app.py: Streamlit UI layout with main-column settings, error handling, metrics grid"
 status: pending
 - id: create-deployment
 content: Create Dockerfile and railway.toml for Railway deployment
@@ -93,19 +93,19 @@ Import: `from model import Kronos, KronosTokenizer, KronosPredictor` (local pack
 
 **Data fetching**: `yfinance.Ticker(ticker).history(period="2y")`, slice last 252 rows (1 year) and last 40 rows (lookback). `amount = volume * open`. `y_timestamp` = next 20 business dates.
 
-**Prediction**: `predictor.predict(df=df_40d, pred_len=20, T=0.8, top_p=0.9, sample_count=10)`
+**Prediction**: `predictor.predict(..., T=0.6, top_p=0.9, sample_count=10)` with RNG seeded to 42 before each run for reproducibility.
 
-**ACWI caching**: `@st.cache_resource` (global, shared across all users/sessions) caches ACWI prediction so it runs once per server. "Clear cache" button in sidebar resets both global ACWI cache and any per-request data.
+**Benchmark caching**: `@st.cache_resource` caches each benchmark ETF’s Kronos prediction keyed by ticker plus lookback and prediction length. The **Clear benchmark cache** button clears cached resources (including benchmark runs); the model loader may reload on next use.
 
 **Technical stats**: SMA 20/50/200 (SMA 200: if insufficient data, display "N/A — need 200+ trading days"), EMA 12/26, RSI 14, MACD/Signal/Hist, Bollinger Bands (20, ±2σ), ATR 14, Avg Volume 20d, Forecasted Return %, 52-Week High/Low, Day Change %, Current Price.
 
 **Prediction visualization**: With `sample_count=10`, compute mean + prediction bands (min/max range shown as shaded area) so users can see prediction confidence.
 
-**Chart 1**: 1-Year % Return — both Asset and ACWI normalized to 0% at start, with predicted returns appended as dashed lines with shaded confidence band. Vertical "Today" separator.
+**Chart 1**: 1-Year % Return — asset and selected benchmark (ACWI, SPY, or CQQQ via dropdown) normalized to 0% at the start of the 1y window, with predicted returns on the same scale as dashed continuations. Vertical "Today" separator.
 
-**Chart 2**: Candlestick — 40 historical + 20 predicted. Predicted candles styled lighter (opacity 0.5). Volume subplot below.
+**Chart 2**: Candlestick — lookback historical + predicted horizon; green/red by OHLC direction; predicted fills slightly transparent. No volume panel.
 
-**UI layout**: Stacked vertical — input at top, charts below, stats grid, ACWI metrics section. Settings in sidebar.
+**UI layout**: Stacked vertical — Settings (benchmark dropdown, lookback/prediction sliders, cache clear) in the main column, then ticker input and charts, then stats grid.
 
 **Error handling**:
 
@@ -115,7 +115,7 @@ Import: `from model import Kronos, KronosTokenizer, KronosPredictor` (local pack
 - Model loading failures → show error with troubleshooting steps
 - Railway RAM limits → warning banner if memory exceeds threshold
 
-**Prediction disclaimer**: Banner at top or sidebar note: "Predictions generated using a general time-series model and are not financial advice."
+**Prediction disclaimer**: Banner at top: "Predictions generated using a general time-series model and are not financial advice."
 
 ## Step 4: Deployment (Dockerfile + Railway)
 
