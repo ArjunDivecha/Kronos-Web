@@ -149,79 +149,91 @@ def predict_ticker(predictor, ticker, lookback_days=40, pred_len=20):
 # TECHNICAL STATS
 # ============================================================
 def compute_stats(df_hist: pd.DataFrame, pred_df: pd.DataFrame, df_full_year: pd.DataFrame = None):
-    """Compute technical indicators from historical + predicted data."""
-    # Combine historical + predicted for indicators that need full context
+    """Compute technical indicators, returned as a grouped dict for Bento Grid.
+
+    Returns dict of { "Section": { "Label": {"value": str, "hero": bool}, ... }, ... }
+    """
     df = pd.concat([df_hist[['open', 'high', 'low', 'close', 'volume']],
                     pred_df[['open', 'high', 'low', 'close', 'volume']]])
     closes = df['close']
-
-    # Use full year data for 52-week stats if available
     source_for_52w = df_full_year if df_full_year is not None else df_hist
 
-    stats = {}
-    # Key prices
-    stats['Current Price'] = f"${df_hist['close'].iloc[-1]:.2f}"
-    stats['Day Change %'] = (
-        f"{((df_hist['close'].iloc[-1] - df_hist['close'].iloc[-2]) / df_hist['close'].iloc[-2] * 100):+.2f}%"
-        if len(df_hist) >= 2 else "N/A"
-    )
-
-    # 52-week high/low
+    # 52-week range
     if len(source_for_52w) >= 252:
         year_high = source_for_52w['high'].tail(252).max()
         year_low = source_for_52w['low'].tail(252).min()
     else:
         year_high = source_for_52w['high'].max()
         year_low = source_for_52w['low'].min()
-    stats['52-Week High'] = f"${year_high:.2f}"
-    stats['52-Week Low'] = f"${year_low:.2f}"
 
-    # SMAs (on full combined data)
-    stats['SMA 20'] = f"${closes.tail(20).mean():.2f}"
-    stats['SMA 50'] = f"${closes.tail(50).mean():.2f}" if len(closes) >= 50 else "N/A"
-    stats['SMA 200'] = f"${closes.mean():.2f}" if len(closes) >= 200 else f"N/A ({len(closes)} days)"
-
-    # EMAs
-    stats['EMA 12'] = f"${closes.ewm(span=12, adjust=False).mean().iloc[-1]:.2f}"
-    stats['EMA 26'] = f"${closes.ewm(span=26, adjust=False).mean().iloc[-1]:.2f}"
+    day_chg = (
+        f"{((df_hist['close'].iloc[-1] - df_hist['close'].iloc[-2]) / df_hist['close'].iloc[-2] * 100):+.2f}%"
+        if len(df_hist) >= 2 else "N/A"
+    )
 
     # RSI
-    rsi_series = ta.momentum.RSIIndicator(df['close'], window=14).rsi()
-    stats['RSI (14)'] = f"{rsi_series.iloc[-1]:.1f}"
-    if rsi_series.iloc[-1] > 70:
-        stats['RSI Signal'] = "Overbought (>70)"
-    elif rsi_series.iloc[-1] < 30:
-        stats['RSI Signal'] = "Oversold (<30)"
+    rsi_val = ta.momentum.RSIIndicator(df['close'], window=14).rsi().iloc[-1]
+    if rsi_val > 70:
+        rsi_signal = "Overbought (>70)"
+    elif rsi_val < 30:
+        rsi_signal = "Oversold (<30)"
     else:
-        stats['RSI Signal'] = "Neutral"
+        rsi_signal = "Neutral"
 
     # MACD
     macd = ta.trend.MACD(closes, window_slow=26, window_fast=12, window_sign=9)
-    stats['MACD'] = f"{macd.macd().iloc[-1]:.2f}"
-    stats['MACD Signal'] = f"{macd.macd_signal().iloc[-1]:.2f}"
-    stats['MACD Histogram'] = f"{macd.macd_diff().iloc[-1]:.2f}"
 
-    # Bollinger Bands
+    # Bollinger
     bb = ta.volatility.BollingerBands(closes, window=20, window_dev=2)
-    stats['BB Upper'] = f"${bb.bollinger_hband().iloc[-1]:.2f}"
-    stats['BB Middle'] = f"${bb.bollinger_mavg().iloc[-1]:.2f}"
-    stats['BB Lower'] = f"${bb.bollinger_lband().iloc[-1]:.2f}"
 
     # ATR
     atr = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=14)
-    stats['ATR (14)'] = f"{atr.average_true_range().iloc[-1]:.2f}"
 
-    # Volume
-    stats['Volume Today'] = f"{df_hist['volume'].iloc[-1]:,.0f}"
-    stats['Avg Volume (20d)'] = f"{df['volume'].tail(20).mean():,.0f}"
+    # Predicted return
+    pred_return = (pred_df['close'].iloc[-1] / df_hist['open'].iloc[-1] - 1) * 100
 
-    # Predicted return (entry = last day open, exit = last predicted close)
-    pred_close = pred_df['close'].iloc[-1]
-    entry = df_hist['open'].iloc[-1]
-    pred_return = (pred_close / entry - 1) * 100
-    stats['Predicted Return (20d)'] = f"{pred_return:+.2f}%"
+    from collections import OrderedDict
+    grouped = OrderedDict()
 
-    return stats
+    grouped["Price"] = OrderedDict([
+        ("Current Price", {"value": f"${df_hist['close'].iloc[-1]:.2f}", "hero": True}),
+        ("Day Change", {"value": day_chg, "hero": False}),
+        ("52-Week High", {"value": f"${year_high:.2f}", "hero": False}),
+        ("52-Week Low", {"value": f"${year_low:.2f}", "hero": False}),
+    ])
+
+    grouped["Trend"] = OrderedDict([
+        ("SMA 20", {"value": f"${closes.tail(20).mean():.2f}", "hero": False}),
+        ("SMA 50", {"value": f"${closes.tail(50).mean():.2f}" if len(closes) >= 50 else "N/A", "hero": False}),
+        ("SMA 200", {"value": f"${closes.mean():.2f}" if len(closes) >= 200 else f"N/A ({len(closes)}d)", "hero": False}),
+        ("EMA 12", {"value": f"${closes.ewm(span=12, adjust=False).mean().iloc[-1]:.2f}", "hero": False}),
+        ("EMA 26", {"value": f"${closes.ewm(span=26, adjust=False).mean().iloc[-1]:.2f}", "hero": False}),
+    ])
+
+    grouped["Momentum"] = OrderedDict([
+        ("RSI (14)", {"value": f"{rsi_val:.1f}", "hero": False}),
+        ("RSI Signal", {"value": rsi_signal, "hero": False}),
+        ("MACD", {"value": f"{macd.macd().iloc[-1]:.2f}", "hero": False}),
+        ("MACD Signal", {"value": f"{macd.macd_signal().iloc[-1]:.2f}", "hero": False}),
+    ])
+
+    grouped["Volatility"] = OrderedDict([
+        ("BB Upper", {"value": f"${bb.bollinger_hband().iloc[-1]:.2f}", "hero": False}),
+        ("BB Middle", {"value": f"${bb.bollinger_mavg().iloc[-1]:.2f}", "hero": False}),
+        ("BB Lower", {"value": f"${bb.bollinger_lband().iloc[-1]:.2f}", "hero": False}),
+        ("ATR (14)", {"value": f"{atr.average_true_range().iloc[-1]:.2f}", "hero": False}),
+    ])
+
+    grouped["Volume"] = OrderedDict([
+        ("Volume Today", {"value": f"{df_hist['volume'].iloc[-1]:,.0f}", "hero": False}),
+        ("Avg Volume (20d)", {"value": f"{df['volume'].tail(20).mean():,.0f}", "hero": False}),
+    ])
+
+    grouped["Forecast"] = OrderedDict([
+        ("Predicted Return", {"value": f"{pred_return:+.2f}%", "hero": True}),
+    ])
+
+    return grouped
 
 
 # ============================================================
@@ -252,109 +264,122 @@ def build_return_chart(
     bench_y = np.concatenate([[bench_today], bench_pred_ret.values]) * 100
     bench_x = pd.DatetimeIndex([today]).append(bench_pred_ret.index)
 
+    from style import (PLOTLY_BG, PLOTLY_FONT, PLOTLY_TITLE_FONT,
+                       PLOTLY_ASSET_COLOR, PLOTLY_BENCH_COLOR, PLOTLY_GRID)
     fig = go.Figure()
 
-    # Historical — muted gray/blue
+    # Historical
     fig.add_trace(go.Scatter(
         x=asset_ret.index, y=asset_ret.values * 100, name=ticker_name,
-        mode='lines', line=dict(color='#22c55e', width=2.5),
-        showlegend=False
+        mode='lines', line=dict(color=PLOTLY_ASSET_COLOR, width=2.5),
+        showlegend=False,
     ))
     fig.add_trace(go.Scatter(
         x=bench_ret.index, y=bench_ret.values * 100, name=benchmark_label,
-        mode='lines', line=dict(color='rgba(128,128,128,0.6)', width=1.5),
-        showlegend=False
+        mode='lines', line=dict(color=PLOTLY_BENCH_COLOR, width=1.5),
+        showlegend=False,
     ))
 
-    # Predicted continuation — brighter green for asset
+    # Predicted continuation
     fig.add_trace(go.Scatter(
         x=asset_x, y=asset_y, name=f'{ticker_name} Predicted',
-        mode='lines', line=dict(color='#16a34a', width=2.5, dash='dash'),
-        showlegend=False
+        mode='lines', line=dict(color=PLOTLY_ASSET_COLOR, width=2.5, dash='dash'),
+        showlegend=False,
     ))
     fig.add_trace(go.Scatter(
         x=bench_x, y=bench_y, name=f'{benchmark_label} Predicted',
-        mode='lines', line=dict(color='rgba(128,128,128,0.4)', width=1.5, dash='dot'),
-        showlegend=False
+        mode='lines', line=dict(color=PLOTLY_BENCH_COLOR, width=1.5, dash='dot'),
+        showlegend=False,
     ))
 
-    # 0% reference line
-    y_min = min(asset_ret.min(), bench_ret.min()) * 100
-    y_max = max(
-        max(asset_ret.max(), bench_ret.max()) * 100,
-        max(asset_y.max(), bench_y.max())
+    # 0% reference
+    fig.add_shape(
+        type='line', x0=asset_ret.index[0], y0=0, x1=asset_x[-1], y1=0,
+        line=dict(color='rgba(0,0,0,0.08)', dash='dash', width=1),
     )
-    fig.add_shape(type='line', x0=asset_ret.index[0], y0=0,
-                  x1=asset_x[-1], y1=0,
-                  line=dict(color='rgba(128,128,128,0.25)', dash='dash', width=1))
 
     # Today marker
-    fig.add_vline(x=today, line_dash='dot', line_color='rgba(128,128,128,0.3)', line_width=1)
+    fig.add_vline(x=today, line_dash='dot', line_color='rgba(0,0,0,0.12)', line_width=1)
     fig.add_annotation(
         x=today, y=0, text='Today',
-        showarrow=False, font=dict(size=10, color='rgb(150,150,150)'),
-        xanchor='center', yanchor='bottom', yshift=5
+        showarrow=False, font=dict(size=10, family=PLOTLY_FONT, color='#94A3B8'),
+        xanchor='center', yanchor='bottom', yshift=5,
     )
 
-    # Clean layout
     fig.update_layout(
-        title=dict(text=f"{ticker_name} vs {benchmark_label}", font=dict(size=16)),
-        plot_bgcolor='white', margin=dict(l=50, r=30, t=50, b=40),
+        title=dict(
+            text=f"{ticker_name} vs {benchmark_label}",
+            font=dict(size=18, family=PLOTLY_TITLE_FONT, color='#1E293B'),
+        ),
+        plot_bgcolor=PLOTLY_BG,
+        paper_bgcolor=PLOTLY_BG,
+        margin=dict(l=50, r=30, t=55, b=40),
         height=420,
+        font=dict(family=PLOTLY_FONT, color='#64748B'),
         legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="right", x=1),
     )
-    fig.update_xaxes(showgrid=False, zeroline=False, title='')
-    fig.update_yaxes(showgrid=False, zeroline=False, title='Return %')
+    fig.update_xaxes(
+        showgrid=True, gridcolor=PLOTLY_GRID, zeroline=False, title='',
+        linecolor='rgba(0,0,0,0.06)',
+    )
+    fig.update_yaxes(
+        showgrid=True, gridcolor=PLOTLY_GRID, zeroline=False, title='Return %',
+        linecolor='rgba(0,0,0,0.06)',
+    )
 
     return fig
 
 
 def build_candlestick_chart(df_hist, pred_df, ticker_name):
     """Single-panel OHLC candlestick: historical + predicted (no volume)."""
+    from style import (PLOTLY_BG, PLOTLY_FONT, PLOTLY_TITLE_FONT, PLOTLY_GRID,
+                       POSITIVE, NEGATIVE)
+
     fig = go.Figure()
 
-    # Historical — solid green/red by direction (close vs open)
     fig.add_trace(go.Candlestick(
         x=df_hist.index,
-        open=df_hist['open'],
-        high=df_hist['high'],
-        low=df_hist['low'],
-        close=df_hist['close'],
+        open=df_hist['open'], high=df_hist['high'],
+        low=df_hist['low'], close=df_hist['close'],
         name="Historical",
-        increasing_line_color="#15803d",
-        decreasing_line_color="#b91c1c",
-        increasing_fillcolor="#22c55e",
-        decreasing_fillcolor="#ef4444",
+        increasing_line_color="#15803d", decreasing_line_color="#b91c1c",
+        increasing_fillcolor=POSITIVE, decreasing_fillcolor=NEGATIVE,
     ))
 
-    # Predicted — same green/red logic, slightly softer fills so it reads as forecast
     fig.add_trace(go.Candlestick(
         x=pred_df.index,
-        open=pred_df['open'],
-        high=pred_df['high'],
-        low=pred_df['low'],
-        close=pred_df['close'],
+        open=pred_df['open'], high=pred_df['high'],
+        low=pred_df['low'], close=pred_df['close'],
         name="Predicted",
-        increasing_line_color="#15803d",
-        decreasing_line_color="#b91c1c",
-        increasing_fillcolor="rgba(34, 197, 94, 0.55)",
-        decreasing_fillcolor="rgba(239, 68, 68, 0.55)",
+        increasing_line_color="#15803d", decreasing_line_color="#b91c1c",
+        increasing_fillcolor="rgba(22,163,74,0.5)",
+        decreasing_fillcolor="rgba(220,38,38,0.5)",
         line=dict(width=1),
     ))
 
     today = df_hist.index[-1]
-    fig.add_vline(
-        x=today, line_dash="dot", line_color="gray", opacity=0.45,
-    )
+    fig.add_vline(x=today, line_dash="dot", line_color="rgba(0,0,0,0.12)", line_width=1)
 
     fig.update_layout(
-        title=f"{ticker_name} — Candlestick (historical + predicted)",
+        title=dict(
+            text=f"{ticker_name} — Candlestick",
+            font=dict(size=18, family=PLOTLY_TITLE_FONT, color='#1E293B'),
+        ),
+        plot_bgcolor=PLOTLY_BG,
+        paper_bgcolor=PLOTLY_BG,
         height=520,
         xaxis_rangeslider_visible=False,
+        font=dict(family=PLOTLY_FONT, color='#64748B'),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
-    fig.update_yaxes(title_text="Price")
-    fig.update_xaxes(title_text="Date")
+    fig.update_yaxes(
+        title_text="Price", showgrid=True, gridcolor=PLOTLY_GRID,
+        linecolor='rgba(0,0,0,0.06)',
+    )
+    fig.update_xaxes(
+        title_text="Date", showgrid=False,
+        linecolor='rgba(0,0,0,0.06)',
+    )
 
     return fig
 
@@ -363,6 +388,8 @@ def build_candlestick_chart(df_hist, pred_df, ticker_name):
 # STREAMLIT APP
 # ============================================================
 def main():
+    from style import inject_css, render_stats_grid
+
     st.set_page_config(
         page_title="Kronos Stock Predictor",
         page_icon="📈",
@@ -370,64 +397,63 @@ def main():
         initial_sidebar_state="collapsed",
     )
 
-    st.title("Kronos Stock Prediction")
-    st.caption("AI-powered prediction with selectable benchmark (ACWI, SPY, or CQQQ)")
+    inject_css()
 
-    # Disclaimer
-    st.info("⚠️ Predictions generated using a general time-series model. Not financial advice.")
+    # Title
+    st.title("Kronos")
+    st.caption("AI-powered stock prediction with selectable benchmark")
 
-    # Settings live in the main column so benchmark / horizons are always visible
-    # (Streamlit’s left sidebar is easy to miss when collapsed).
-    st.subheader("Settings")
-    col_b, col_l, col_p = st.columns([1.5, 1, 1])
+    # Glassmorphic settings bar
+    st.markdown('<div class="glass-bar">', unsafe_allow_html=True)
+    col_b, col_l, col_p, col_t, col_btn = st.columns([1.4, 0.8, 0.8, 1.2, 0.6])
     with col_b:
         benchmark = st.selectbox(
-            "Benchmark ETF",
+            "Benchmark",
             options=list(BENCHMARK_CHOICES),
             index=0,
             format_func=lambda t: BENCHMARK_LABELS.get(t, t),
-            help="Compare 1-year return vs this ETF and use it for the benchmark forecast.",
         )
     with col_l:
-        lookback = st.slider(
-            "Lookback Days", min_value=20, max_value=100, value=40, step=5
-        )
+        lookback = st.slider("Lookback", min_value=20, max_value=100, value=40, step=5)
     with col_p:
-        pred_len = st.slider(
-            "Prediction Days", min_value=5, max_value=30, value=20, step=5
-        )
-    if st.button(
-        "Clear benchmark cache",
-        help="Clear cached benchmark predictions (model stays loaded)",
-    ):
-        st.cache_resource.clear()
-        st.success("Cache cleared. Benchmarks will be re-predicted on the next run.")
+        pred_len = st.slider("Forecast", min_value=5, max_value=30, value=20, step=5)
+    with col_t:
+        ticker = st.text_input("Ticker", value="AAPL", label_visibility="visible").strip().upper()
+    with col_btn:
+        st.markdown("<div style='height:25px'></div>", unsafe_allow_html=True)
+        run_clicked = st.button("Run Prediction", type="primary")
+    st.markdown('</div>', unsafe_allow_html=True)
 
-    st.divider()
+    # Disclaimer (muted line)
+    st.markdown(
+        '<p class="disclaimer-text">Predictions generated by a general time-series model. Not financial advice.</p>',
+        unsafe_allow_html=True,
+    )
 
-    # Input
-    ticker = st.text_input("Enter Ticker Symbol", value="AAPL").strip().upper()
+    # Cache clear
+    col_cache, _ = st.columns([0.2, 0.8])
+    with col_cache:
+        if st.button("Clear cache"):
+            st.cache_resource.clear()
+            st.success("Cleared.")
 
-    if st.button("Run Prediction", type="primary", use_container_width=True):
+    if run_clicked:
         if not ticker:
             st.error("Please enter a ticker symbol.")
             return
 
         try:
-            # Fetch full year data for stats (does this first so we can show it if model fails)
             with st.spinner(f"Fetching {ticker} data..."):
                 df_full_year = fetch_yfinance_data(ticker, "1y")
                 if df_full_year is None or df_full_year.empty:
-                    st.error(f"No data found for '{ticker}'. Check the ticker symbol.")
+                    st.error(f"No data found for \'{ticker}\'. Check the ticker symbol.")
                     return
 
-            # Load model
             with st.spinner("Loading Kronos model..."):
                 predictor = load_model()
 
-            # Benchmark history + Kronos forecast (cached per ticker / horizons)
             bench_label = BENCHMARK_LABELS.get(benchmark, benchmark)
-            with st.spinner(f"Fetching & predicting {benchmark} benchmark..."):
+            with st.spinner(f"Predicting {benchmark} benchmark..."):
                 try:
                     bench_pred = predict_benchmark(benchmark, lookback, pred_len)
                     bench_hist_full = fetch_yfinance_data(benchmark, "1y")
@@ -435,11 +461,10 @@ def main():
                     bench_pred = None
                     bench_hist_full = None
 
-            # Run prediction
-            with st.spinner(f"Predicting {ticker} ({lookback}d lookback → {pred_len}d forecast)..."):
+            with st.spinner(f"Predicting {ticker} ({lookback}d \u2192 {pred_len}d)..."):
                 hist_df = df_full_year.tail(lookback)
                 if len(hist_df) < lookback:
-                    st.error(f"Insufficient data: {len(df_full_year)} days available, need {lookback}+")
+                    st.error(f"Insufficient data: {len(df_full_year)} days, need {lookback}+")
                     return
 
                 y_timestamp = get_business_dates(
@@ -452,47 +477,32 @@ def main():
                     sample_count=KRONOS_SAMPLE_COUNT,
                 )
 
-            # Compute stats
-            stats = compute_stats(hist_df, pred_df, df_full_year)
+            grouped_stats = compute_stats(hist_df, pred_df, df_full_year)
 
-            # Display results
-            st.divider()
-            st.subheader(f"Prediction for {ticker}")
+            # Results
+            st.markdown("---")
 
-            # Chart 1: 1-Year % Return
             if bench_hist_full is not None and bench_pred is not None and not bench_hist_full.empty:
                 st.plotly_chart(
                     build_return_chart(
-                        df_full_year,
-                        pred_df,
-                        bench_hist_full,
-                        bench_pred,
-                        ticker,
-                        bench_label,
+                        df_full_year, pred_df,
+                        bench_hist_full, bench_pred,
+                        ticker, bench_label,
                     ),
                     use_container_width=True,
                 )
             else:
-                st.warning(
-                    f"Could not load or predict benchmark {benchmark}. "
-                    "Check the symbol or try again."
-                )
+                st.warning(f"Could not load benchmark {benchmark}.")
 
-            # Chart 2: Candlestick
             st.plotly_chart(
                 build_candlestick_chart(hist_df, pred_df, ticker),
-                use_container_width=True
+                use_container_width=True,
             )
 
-            # Stats grid
-            st.subheader("Technical Statistics")
-            cols = st.columns(4)
-            for i, (key, val) in enumerate(stats.items()):
-                cols[i % 4].metric(key, val)
+            render_stats_grid(grouped_stats)
 
         except Exception as e:
             st.error(f"Error: {str(e)}")
-
 
 if __name__ == "__main__":
     main()
