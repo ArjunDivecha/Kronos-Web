@@ -298,10 +298,16 @@ def build_return_chart(
         line=dict(color='rgba(0,0,0,0.08)', dash='dash', width=1),
     )
 
-    # Today marker
-    fig.add_vline(x=today, line_dash='dot', line_color='rgba(0,0,0,0.12)', line_width=1)
+    # Demarcation between historical and predicted
+    fig.add_vrect(
+        x0=today,
+        x1=asset_x[-1],
+        fillcolor='rgba(59,130,246,0.14)',
+        line_width=0,
+        layer='below',
+    )
     fig.add_annotation(
-        x=today, y=0, text='Today',
+        x=today, y=0.02, yref='paper', text='Today',
         showarrow=False, font=dict(size=10, family=PLOTLY_FONT, color='#94A3B8'),
         xanchor='center', yanchor='bottom', yshift=5,
     )
@@ -355,11 +361,20 @@ def build_candlestick_chart(df_hist, pred_df, ticker_name):
         increasing_fillcolor="rgba(22,163,74,0.5)",
         decreasing_fillcolor="rgba(220,38,38,0.5)",
         line=dict(width=1),
+        opacity=0.6,
     ))
 
-    today = df_hist.index[-1]
-    fig.add_vline(x=today, line_dash="dot", line_color="rgba(0,0,0,0.12)", line_width=1)
+    forecast_start = pred_df.index[0]
+    chart_end = pred_df.index[-1]
 
+    # Demarcation between historical and predicted
+    fig.add_vrect(
+        x0=forecast_start,
+        x1=chart_end,
+        fillcolor="rgba(59,130,246,0.14)",
+        line_width=0,
+        layer="below",
+    )
     fig.update_layout(
         title=dict(
             text=f"{ticker_name} — Candlestick",
